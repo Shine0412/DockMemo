@@ -32,6 +32,9 @@ class DockMemoWindow(QMainWindow):
         self.current_note_id = None
         self.is_expanded = False
         self._expand_time = 0  # 展开时间戳，用于宽限期
+        self._quitting = False       # 是否正在退出（托盘退出流程）
+        self._fullscreen = False     # 前台是否存在全屏程序
+        self._fullscreen_prev_expanded = False  # 进入全屏前的展开状态
 
         self.edit_timer = QTimer()
         self.edit_timer.setSingleShot(True)
@@ -316,7 +319,7 @@ class DockMemoWindow(QMainWindow):
 
         tray_menu.addSeparator()
         quit_action = QAction("退出", self)
-        quit_action.triggered.connect(QApplication.instance().quit)
+        quit_action.triggered.connect(self.quit_app)
         tray_menu.addAction(quit_action)
 
         self.tray.setContextMenu(tray_menu)
@@ -333,6 +336,18 @@ class DockMemoWindow(QMainWindow):
         else:
             autostart_disable()
 
+    def quit_app(self):
+        """真正退出：强制保存 → 隐藏托盘 → 关闭窗口 → 退出事件循环"""
+        self._quitting = True
+        if self.edit_timer.isActive():
+            self.edit_timer.stop()
+            self.save_current_note()
+        # 先移除托盘图标，避免 Windows 上残留
+        self.tray.hide()
+        self.close()
+        # 等托盘菜单的模态循环结束后再退出，确保进程真正结束
+        QTimer.singleShot(0, QApplication.quit)
+
     # ---------- 边缘检测 ----------
     def init_detect_timer(self):
         self.detect_timer = QTimer()
@@ -344,7 +359,16 @@ class DockMemoWindow(QMainWindow):
         self.hide_timer.setSingleShot(True)
         self.hide_timer.timeout.connect(self.maybe_collapse)
 
+        # 全屏程序检测：前台窗口全屏时隐藏自身，不挡在全屏程序前面
+        self.fullscreen_timer = QTimer()
+        self.fullscreen_timer.setInterval(300)
+        self.fullscreen_timer.timeout.connect(self.check_fullscreen)
+        self.fullscreen_timer.start()
+
     def check_mouse_edge(self):
+        # 全屏程序在前台时不响应边缘（避免挡在全屏程序前面）
+        if self._fullscreen:
+            return
         pos = QCursor.pos()
         screen = QApplication.primaryScreen().geometry()
         edge = self.config.get("edge", "right")
@@ -376,6 +400,59 @@ class DockMemoWindow(QMainWindow):
         if not self.geometry().contains(pos):
             self.collapse()
 
+    # ---------- 全屏检测 ----------
+    def is_fullscreen_foreground(self):
+        """前台窗口是否处于全屏状态（无边框且覆盖整个主屏）"""
+        if sys.platform != "win32":
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd or int(self.winId()) == hwnd:
+                return False
+            rect = wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            sw = user32.GetSystemMetrics(0)  # SM_CXSCREEN
+            sh = user32.GetSystemMetrics(1)  # SM_CYSCREEN
+            if sw <= 0 or sh <= 0:
+                return False
+            # 覆盖整个主屏（含任务栏区域），排除普通最大化窗口
+            covers_screen = (
+                rect.left <= 0
+                and rect.top <= 0
+                and rect.right >= sw - 1
+                and rect.bottom >= sh - 1
+            )
+            if not covers_screen:
+                return False
+            # 无标题栏/边框（WS_CAPTION = 0x00C00000），全屏游戏/视频均为无边框
+            style = user32.GetWindowLongW(hwnd, -16)  # GWL_STYLE
+            return not bool(style & 0x00C00000)
+        except Exception:
+            return False
+
+    def check_fullscreen(self):
+        """全屏程序出现时隐藏自身，退出全屏后恢复之前的状态"""
+        fullscreen = self.is_fullscreen_foreground()
+        if fullscreen == self._fullscreen:
+            return
+        self._fullscreen = fullscreen
+        if fullscreen:
+            # 进入全屏：记住展开状态并隐藏，不再挡在全屏程序前面
+            self._fullscreen_prev_expanded = self.is_expanded
+            if self.is_expanded:
+                self.collapse()
+            self.hide()
+        else:
+            # 退出全屏：恢复之前的显示状态
+            if self._fullscreen_prev_expanded:
+                self.expand()
+            else:
+                self.show()
+                self.align_to_edge()
+
     # ---------- 窗口位置 ----------
     def align_to_edge(self):
         screen = QApplication.primaryScreen().availableGeometry()
@@ -390,6 +467,10 @@ class DockMemoWindow(QMainWindow):
 
     def expand(self):
         if self.is_expanded:
+            return
+        if self._fullscreen:
+            # 全屏程序在前台时不弹出，但记住用户意图，退出全屏后恢复
+            self._fullscreen_prev_expanded = True
             return
         self.is_expanded = True
         self._expand_time = time.time()
@@ -622,5 +703,8 @@ class DockMemoWindow(QMainWindow):
             super().keyPressEvent(event)
 
     def closeEvent(self, event):
-        event.ignore()
-        self.collapse()
+        if self._quitting:
+            event.accept()
+        else:
+            event.ignore()
+            self.collapse()

@@ -1,0 +1,8 @@
+# 统一换行符策略：所有文本文件固定 LF（覆盖全局 core.autocrlf 的 CRLF 转换）
+# 二进制文件由 text=auto 自动识别，不做行尾转换
+* text=auto eol=lf
+
+# 显式声明二进制，避免含文本片段被误判
+*.ico binary
+*.png binary
+*.exe binary
