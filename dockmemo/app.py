@@ -1,4 +1,5 @@
 """主窗口"""
+import re
 import sys
 import time
 from pathlib import Path
@@ -9,7 +10,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QListWidgetItem, QTextEdit, QLineEdit, QPushButton,
     QSystemTrayIcon, QMenu, QLabel, QFrame, QSplitter, QStyle,
-    QInputDialog, QMessageBox
+    QInputDialog, QMessageBox, QFileDialog
 )
 
 from . import __app_name__
@@ -561,10 +562,14 @@ class DockMemoWindow(QMainWindow):
             QMenu::item {{ padding: 6px 20px; border-radius: 4px; color: {PRIMARY_TEXT}; }}
             QMenu::item:selected {{ background-color: {SELECTED_BG}; }}
         """)
+        export_action = QAction("导出为文件...", self)
+        export_action.triggered.connect(lambda: self.export_note(note_id))
         rename_action = QAction("重命名", self)
         rename_action.triggered.connect(lambda: self.rename_note(note_id))
         delete_action = QAction("删除", self)
         delete_action.triggered.connect(lambda: self.delete_note_by_id(note_id))
+        menu.addAction(export_action)
+        menu.addSeparator()
         menu.addAction(rename_action)
         menu.addAction(delete_action)
         menu.exec(self.note_list.viewport().mapToGlobal(pos))
@@ -582,6 +587,65 @@ class DockMemoWindow(QMainWindow):
             note["updated_at"] = datetime.now().isoformat()
             save_notes(self.notes)
             self.refresh_list(keep_selection=True)
+
+    def export_note(self, note_id):
+        """将单条笔记导出为 Markdown 或纯文本文件"""
+        note = self.find_note(note_id)
+        if not note:
+            return
+        title = note.get("title", "").strip() or "无标题"
+        # 清理 Windows 文件名字符
+        safe = re.sub(r'[\\/:*?"<>|]', "_", title).strip() or "无标题"
+        default_path = str(Path.home() / f"{safe}.md")
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, "导出笔记", default_path,
+            "Markdown 文件 (*.md);;纯文本文件 (*.txt)"
+        )
+        if not path:
+            return
+        fmt = "md"
+        if path.lower().endswith(".txt"):
+            fmt = "txt"
+        elif not path.lower().endswith(".md"):
+            # 用户未带后缀：按所选过滤器补齐
+            fmt = "txt" if "纯文本" in selected_filter else "md"
+            path += ".txt" if fmt == "txt" else ".md"
+        try:
+            # newline="" 保持 LF，不随 Windows 转成 CRLF
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(self._format_export(note, fmt))
+        except OSError as e:
+            QMessageBox.warning(self, "导出失败", f"无法写入文件：\n{e}")
+            return
+        QMessageBox.information(self, "导出成功", f"已导出到：\n{path}")
+
+    def _format_export(self, note, fmt):
+        """构建导出文本：fmt = 'md' | 'txt'，统一 LF 换行"""
+        title = note.get("title", "").strip() or "无标题"
+        content = note.get("content", "").strip()
+        created = self._format_time(note.get("created_at", ""))
+        updated = self._format_time(note.get("updated_at", ""))
+        if fmt == "txt":
+            return (
+                f"{title}\n{'=' * max(len(title), 4)}\n\n"
+                f"创建于 {created} · 更新于 {updated}\n\n"
+                f"{content or '（空笔记）'}\n"
+            )
+        return (
+            f"# {title}\n\n"
+            f"> 创建于 {created} · 更新于 {updated}\n\n"
+            f"{content or '（空笔记）'}\n"
+        )
+
+    def _format_time(self, iso):
+        """ISO 时间转为可读格式，解析失败时原样返回"""
+        if not iso:
+            return "未知"
+        try:
+            from datetime import datetime
+            return datetime.fromisoformat(iso).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return iso
 
     def delete_note_by_id(self, note_id):
         note = self.find_note(note_id)
