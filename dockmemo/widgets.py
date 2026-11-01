@@ -16,7 +16,7 @@ class NoteListItem(QWidget):
         layout.setContentsMargins(14, 10, 14, 10)
         layout.setSpacing(3)
 
-        title = note.get("title", "无标题")
+        title = note.get("title") or "无标题"
         updated = note.get("updated_at", "")
         try:
             dt = datetime.fromisoformat(updated)

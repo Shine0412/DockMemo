@@ -65,19 +65,5 @@ LIGHT = {
     "HOVER_BG": "#f8fafc",
 }
 
-# 根据系统主题选择配色
-_theme = DARK if is_system_dark() else LIGHT
-
-BG_COLOR = _theme["BG_COLOR"]
-CARD_COLOR = _theme["CARD_COLOR"]
-BORDER_COLOR = _theme["BORDER_COLOR"]
-PRIMARY_TEXT = _theme["PRIMARY_TEXT"]
-SECONDARY_TEXT = _theme["SECONDARY_TEXT"]
-MUTED_TEXT = _theme["MUTED_TEXT"]
-ACCENT = _theme["ACCENT"]
-ACCENT_HOVER = _theme["ACCENT_HOVER"]
-SELECTED_BG = _theme["SELECTED_BG"]
-DANGER = _theme["DANGER"]
-DANGER_HOVER = _theme["DANGER_HOVER"]
-SUCCESS = _theme["SUCCESS"]
-HOVER_BG = _theme["HOVER_BG"]
+# 根据系统主题选择配色并导出为模块常量
+globals().update(DARK if is_system_dark() else LIGHT)
