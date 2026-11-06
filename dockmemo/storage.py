@@ -17,15 +17,18 @@ def _atomic_write(path, data):
 
 
 def load_notes():
-    """读取笔记；文件损坏时备份为 .corrupt.bak 而不是静默丢弃"""
+    """读取笔记；文件损坏时备份（带时间戳，不覆盖历史备份）而不是静默丢弃"""
     if not NOTES_FILE.exists():
         return []
     try:
         with open(NOTES_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
+        bak = NOTES_FILE.with_name(
+            f"notes.corrupt-{datetime.now():%Y%m%d-%H%M%S}.bak"
+        )
         try:
-            NOTES_FILE.rename(NOTES_FILE.with_name("notes.corrupt.bak"))
+            NOTES_FILE.rename(bak)
         except OSError:
             pass
         return []

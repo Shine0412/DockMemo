@@ -11,7 +11,7 @@ CONFIG_FILE = APP_DIR / "config.json"
 EXPANDED_WIDTH = 360
 COLLAPSED_WIDTH = 6
 SCREEN_EDGE_MARGIN = 12
-HIDE_DELAY_MS = 50
+HIDE_DELAY_MS = 200  # 鼠标移出窗口后多久收起；过短会因瞬时移出误收起
 
 
 def is_system_dark():

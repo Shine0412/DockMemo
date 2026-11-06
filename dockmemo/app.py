@@ -48,6 +48,7 @@ class DockMemoWindow(QMainWindow):
         self._quitting = False  # 是否正在退出（托盘退出流程）
         self._fullscreen = False  # 前台是否存在全屏程序
         self._fullscreen_prev_expanded = False  # 进入全屏前的展开状态
+        self._order_cache = None  # 列表顺序缓存 (keyword, [note_ids])，编辑期间保持顺序稳定
 
         self.edit_timer = QTimer(self)
         self.edit_timer.setSingleShot(True)
@@ -196,6 +197,8 @@ class DockMemoWindow(QMainWindow):
             QListWidget::item:hover {{ background-color: {HOVER_BG}; }}
         """)
         self.note_list.itemClicked.connect(self.on_note_selected)
+        # 方向键/列表高亮变化时也切换笔记（不仅是鼠标点击）
+        self.note_list.currentItemChanged.connect(self.on_current_item_changed)
         self.note_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.note_list.customContextMenuRequested.connect(self.show_list_context_menu)
         list_layout.addWidget(self.note_list)
@@ -338,13 +341,34 @@ class DockMemoWindow(QMainWindow):
         self.fullscreen_timer.timeout.connect(self.check_fullscreen)
         self.fullscreen_timer.start()
 
+    def _mouse_screen(self):
+        """鼠标所在的屏幕，找不到时回退主屏"""
+        pos = QCursor.pos()
+        for screen in QApplication.screens():
+            if screen.geometry().contains(pos):
+                return screen
+        return QApplication.primaryScreen()
+
+    def _is_outer_edge(self, screen, edge):
+        """只有虚拟桌面的最外侧边缘才算触发区，
+        避免多屏拼接缝隙（如左屏右缘）误触发"""
+        geos = [s.geometry() for s in QApplication.screens()]
+        g = screen.geometry()
+        if edge == "right":
+            return g.right() == max(geo.right() for geo in geos)
+        return g.left() == min(geo.left() for geo in geos)
+
     def check_mouse_edge(self):
         # 全屏程序在前台时不响应边缘（避免挡在全屏程序前面）
         if self._fullscreen:
             return
         pos = QCursor.pos()
-        geo = QApplication.primaryScreen().geometry()
+        screen = self._mouse_screen()
         edge = self.config.get("edge", "right")
+        if not self._is_outer_edge(screen, edge):
+            return
+        # 用 availableGeometry（不含任务栏），与窗口停靠位置保持同一基准
+        geo = screen.availableGeometry()
 
         near_edge = (
             pos.x() >= geo.x() + geo.width() - SCREEN_EDGE_MARGIN
@@ -384,14 +408,14 @@ class DockMemoWindow(QMainWindow):
                 return False
             rect = wintypes.RECT()
             user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            sw = user32.GetSystemMetrics(0)  # SM_CXSCREEN
-            sh = user32.GetSystemMetrics(1)  # SM_CYSCREEN
-            if sw <= 0 or sh <= 0:
-                return False
-            # 覆盖整个主屏（含任务栏区域），排除普通最大化窗口
+            # 面板所在屏幕（Qt 全局坐标与 Win32 虚拟桌面坐标一致），
+            # 多显示器时只关心挡住面板的那块屏
+            geo = (self.screen() or QApplication.primaryScreen()).geometry()
+            # 覆盖整块屏幕（含任务栏区域），排除普通最大化窗口
             covers_screen = (
-                rect.left <= 0 and rect.top <= 0
-                and rect.right >= sw - 1 and rect.bottom >= sh - 1
+                rect.left <= geo.x() and rect.top <= geo.y()
+                and rect.right >= geo.x() + geo.width() - 1
+                and rect.bottom >= geo.y() + geo.height() - 1
             )
             if not covers_screen:
                 return False
@@ -420,8 +444,8 @@ class DockMemoWindow(QMainWindow):
 
     # ---------- 窗口位置 ----------
     def _apply_geometry(self, width):
-        """把窗口停靠到配置的边缘，宽度为 width"""
-        screen = QApplication.primaryScreen().availableGeometry()
+        """把窗口停靠到「鼠标所在屏幕」配置的边缘，宽度为 width"""
+        screen = self._mouse_screen().availableGeometry()
         if self.config.get("edge", "right") == "right":
             x = screen.x() + screen.width() - width
         else:
@@ -452,7 +476,10 @@ class DockMemoWindow(QMainWindow):
         self._apply_geometry(COLLAPSED_WIDTH)
 
     def toggle_expand(self):
-        self.collapse() if self.is_expanded else self.expand()
+        if self.is_expanded:
+            self.collapse()
+        else:
+            self.expand()
 
     def set_edge(self, edge):
         self.config["edge"] = edge
@@ -513,7 +540,11 @@ class DockMemoWindow(QMainWindow):
         note["updated_at"] = datetime.now().isoformat()
         save_notes(self.notes)
         self._set_save_indicator(True)
-        self.refresh_list()
+        # 可见集合未变时只就地更新当前项的文本，避免每次保存都重建整个列表
+        if self._list_visible_set_matches():
+            self._update_list_item(note)
+        else:
+            self.refresh_list()
 
     # ---------- 笔记操作 ----------
     def create_note(self):
@@ -558,6 +589,8 @@ class DockMemoWindow(QMainWindow):
             note = self.find_note(note_id)
             if note:
                 self._set_editors(note.get("title", ""), note.get("content", ""))
+            # 切换时重新按更新时间排序（刚编辑完的笔记升上去）
+            self.refresh_list(force_resort=True)
         self._highlight_item(note_id)
 
     def _highlight_item(self, note_id):
@@ -575,30 +608,83 @@ class DockMemoWindow(QMainWindow):
     def find_note(self, note_id):
         return next((n for n in self.notes if n["id"] == note_id), None)
 
-    def refresh_list(self):
-        """重建笔记列表（搜索过滤 + 按更新时间排序），并保持当前项高亮。
-        只动列表，不动编辑器——这是自动保存路径，重写编辑器会导致光标跳动。"""
+    def _visible_note_ids(self):
+        """按当前搜索关键字，应该可见的笔记 id 集合"""
         keyword = self.search_box.text().strip().lower()
-        self.note_list.clear()
+        return {
+            n["id"] for n in self.notes
+            if not keyword
+            or keyword in n.get("title", "").lower()
+            or keyword in n.get("content", "").lower()
+        }
 
+    def _list_visible_set_matches(self):
+        """列表里已渲染的笔记集合是否与应可见集合一致（一致则无需重建）"""
+        current = {
+            self.note_list.item(i).data(Qt.UserRole)
+            for i in range(self.note_list.count())
+        }
+        return current == self._visible_note_ids()
+
+    def _update_list_item(self, note):
+        """就地更新某条笔记的列表项文本，不重建列表"""
+        for i in range(self.note_list.count()):
+            item = self.note_list.item(i)
+            if item.data(Qt.UserRole) == note["id"]:
+                widget = self.note_list.itemWidget(item)
+                if isinstance(widget, NoteListItem):
+                    widget.set_note(note)
+                return
+
+    def refresh_list(self, force_resort: bool = False):
+        """重建笔记列表（搜索过滤 + 排序），并保持当前项高亮。
+        只动列表，不动编辑器——重写编辑器会导致光标跳动。
+        force_resort=False 且可见集合未变时沿用上次顺序，
+        避免编辑笔记时它反复跳到列表顶部。"""
+        keyword = self.search_box.text().strip().lower()
         filtered = [
             n for n in self.notes
             if not keyword
             or keyword in n.get("title", "").lower()
             or keyword in n.get("content", "").lower()
         ]
-        filtered.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
 
-        for note in filtered:
-            item = QListWidgetItem(self.note_list)
-            item.setData(Qt.UserRole, note["id"])
-            item.setSizeHint(QSize(0, 64))
-            self.note_list.addItem(item)
-            self.note_list.setItemWidget(item, NoteListItem(note))
+        cache = self._order_cache
+        cache_valid = (
+            cache is not None
+            and not force_resort
+            and cache[0] == keyword
+            and {n["id"] for n in filtered} == set(cache[1])
+        )
+        if cache_valid:
+            order = {nid: i for i, nid in enumerate(cache[1])}
+            filtered.sort(key=lambda n: order[n["id"]])
+        else:
+            filtered.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+            self._order_cache = (keyword, [n["id"] for n in filtered])
 
-        self.status_label.setText(f"{len(filtered)} 条笔记")
-        if self.current_note_id:
-            self._highlight_item(self.current_note_id)
+        # 重建期间屏蔽信号：clear()/setCurrentItem 会同步派发
+        # currentItemChanged，处理函数再操作列表会导致 C++ 层崩溃
+        self.note_list.blockSignals(True)
+        try:
+            self.note_list.clear()
+            for note in filtered:
+                item = QListWidgetItem(self.note_list)
+                item.setData(Qt.UserRole, note["id"])
+                item.setSizeHint(QSize(0, 64))
+                self.note_list.addItem(item)
+                self.note_list.setItemWidget(item, NoteListItem(note))
+
+            self.status_label.setText(f"{len(filtered)} 条笔记")
+            if self.current_note_id:
+                self._highlight_item(self.current_note_id)
+        finally:
+            self.note_list.blockSignals(False)
+
+    def on_current_item_changed(self, current, previous):
+        """列表高亮变化（方向键、点击）时加载对应笔记到编辑器"""
+        if current is not None:
+            self.select_note(current.data(Qt.UserRole))
 
     # ---------- 右键菜单 ----------
     def show_list_context_menu(self, pos):
@@ -637,7 +723,8 @@ class DockMemoWindow(QMainWindow):
             self.title_edit.blockSignals(True)
             self.title_edit.setText(note["title"])
             self.title_edit.blockSignals(False)
-        self.refresh_list()
+        # 重命名会更新 updated_at，按原行为重新排序
+        self.refresh_list(force_resort=True)
 
     def export_note(self, note_id):
         """将单条笔记导出为 Markdown 或纯文本文件"""
@@ -700,11 +787,14 @@ class DockMemoWindow(QMainWindow):
 
     # ---------- 快捷键 ----------
     def keyPressEvent(self, event):
+        focused = self.focusWidget()
+        in_input = isinstance(focused, (QLineEdit, QTextEdit))
         if event.matches(QKeySequence.New):
             self.create_note()
         elif event.matches(QKeySequence.Find):
             self.search_box.setFocus()
-        elif event.matches(QKeySequence.Delete):
+        elif event.matches(QKeySequence.Delete) and not in_input:
+            # 焦点在输入框时不删笔记（空编辑器/搜索框里按 Delete 会误触发）
             self.delete_current_note()
         else:
             super().keyPressEvent(event)

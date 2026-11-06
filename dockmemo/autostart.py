@@ -1,4 +1,5 @@
 """开机自启管理（Windows 注册表）"""
+import os
 import sys
 import winreg
 
@@ -7,7 +8,8 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
 def is_supported():
-    return sys.platform == "win32"
+    # 仅打包后的 exe 可注册自启；开发模式（python 运行）不显示该菜单项
+    return sys.platform == "win32" and getattr(sys, "frozen", False)
 
 
 def get_executable_path():
@@ -19,18 +21,28 @@ def get_executable_path():
 
 
 def is_enabled():
-    """检查是否已开启开机自启"""
+    """检查是否已开启开机自启；注册的路径已失效时清理并视为未开启"""
     if not is_supported():
         return False
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ)
         value, _ = winreg.QueryValueEx(key, APP_NAME)
         winreg.CloseKey(key)
-        return bool(value)
-    except FileNotFoundError:
-        return False
     except OSError:
         return False
+    if not value:
+        return False
+    # exe 被移动/删除后注册表项已失效：清理，避免勾选状态与实际不符
+    exe = value.strip().strip('"')
+    if not os.path.exists(exe):
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE)
+            winreg.DeleteValue(key, APP_NAME)
+            winreg.CloseKey(key)
+        except OSError:
+            pass
+        return False
+    return True
 
 
 def enable():
